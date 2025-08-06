@@ -54,16 +54,16 @@ const getRealisticSpeed = (distance, tripSegments) => {
   
   if (hasTollSegments) {
     // Toll highways: 80-100 km/h as requested
-    baseSpeed = Math.floor(Math.random() * (100 - 80 + 1)) + 80
+    baseSpeed = Math.floor(Math.random() * (100 - 40 + 1)) + 40
   } else if (distance < 50) {
     // City routes: 25-40 km/h (traffic, stops)
-    baseSpeed = Math.floor(Math.random() * (40 - 25 + 1)) + 25
+    baseSpeed = Math.floor(Math.random() * (50 - 5 + 1)) + 5
   } else if (distance < 150) {
     // Inter-city routes: 45-65 km/h (mixed roads)
-    baseSpeed = Math.floor(Math.random() * (65 - 45 + 1)) + 45
+    baseSpeed = Math.floor(Math.random() * (50 - 20 + 1)) + 20
   } else {
     // Long distance routes: 60-80 km/h (highways with stops)
-    baseSpeed = Math.floor(Math.random() * (80 - 60 + 1)) + 60
+    baseSpeed = Math.floor(Math.random() * (80 - 20 + 1)) + 20
   }
   
   // Add random variation for traffic conditions (-10 to +5 km/h)
