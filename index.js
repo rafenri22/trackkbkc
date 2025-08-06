@@ -1,6 +1,7 @@
 const express = require("express")
 const cors = require("cors")
 const { createClient } = require("@supabase/supabase-js")
+const { calculateRouteFromSegments } = require("./lib/routing")
 require("dotenv").config()
 
 const app = express()
@@ -45,11 +46,16 @@ const calculateDistance = (lat1, lng1, lat2, lng2) => {
 const toRadians = (degrees) => degrees * (Math.PI / 180)
 
 // Realistic speed calculation based on route type and conditions
-const getRealisticSpeed = (distance) => {
+const getRealisticSpeed = (distance, tripSegments) => {
   let baseSpeed
   
-  // Determine speed based on distance (route type)
-  if (distance < 50) {
+  // Check if route has toll segments
+  const hasTollSegments = tripSegments && tripSegments.some(s => s.type === 'toll_entry' || s.type === 'toll_exit')
+  
+  if (hasTollSegments) {
+    // Toll highways: 80-100 km/h as requested
+    baseSpeed = Math.floor(Math.random() * (100 - 80 + 1)) + 80
+  } else if (distance < 50) {
     // City routes: 25-40 km/h (traffic, stops)
     baseSpeed = Math.floor(Math.random() * (40 - 25 + 1)) + 25
   } else if (distance < 150) {
@@ -75,9 +81,9 @@ const formatElapsedTime = (minutes) => {
   return `${mins}m`
 }
 
-// Enhanced tracking with bus destination parking
+// PERBAIKAN UTAMA: Enhanced tracking yang menggunakan route coordinates yang sudah ada
 const startTripTracking = async (trip) => {
-  console.log(`🚀 Starting backend tracking for trip: ${trip.id}`)
+  console.log(`🚀 Starting SYNCHRONIZED backend tracking for trip: ${trip.id}`)
 
   // Stop existing tracking if any
   if (trackingIntervals.has(trip.id)) {
@@ -86,40 +92,71 @@ const startTripTracking = async (trip) => {
 
   // Get bus info
   const { data: bus } = await supabase.from("buses").select("*").eq("id", trip.bus_id).single()
-
   const tripName = bus?.nickname || trip.id.slice(0, 8)
 
-  // Calculate total distance
+  // PERBAIKAN UTAMA: Gunakan route coordinates yang sudah ada di trip, jangan hitung ulang
+  let routeCoordinates = []
   let totalDistance = 0
-  if (trip.route && trip.route.length > 1) {
-    for (let i = 0; i < trip.route.length - 1; i++) {
-      const point1 = trip.route[i]
-      const point2 = trip.route[i + 1]
-      totalDistance += calculateDistance(point1.lat, point1.lng, point2.lat, point2.lng)
+  let estimatedDuration = trip.estimated_duration || 0
+
+  if (trip.route && trip.route.length > 0) {
+    // BAGUS: Gunakan route coordinates yang sudah tersimpan (sinkron dengan preview)
+    routeCoordinates = trip.route
+    totalDistance = trip.distance || 0
+    console.log(`✅ Using SYNCHRONIZED route with ${routeCoordinates.length} points from trip database`)
+  } else if (trip.segments && trip.segments.length > 0) {
+    // Fallback: hitung route dari segments (hanya jika tidak ada route tersimpan)
+    console.log(`⚠️ No route found in trip, calculating from segments...`)
+    try {
+      const routeData = await calculateRouteFromSegments(trip.segments)
+      routeCoordinates = routeData.coordinates
+      totalDistance = routeData.distance
+      estimatedDuration = routeData.duration
+      
+      // Simpan route hasil perhitungan ke database untuk konsistensi
+      await supabase
+        .from("trips")
+        .update({
+          route: routeCoordinates,
+          distance: totalDistance,
+          estimated_duration: estimatedDuration,
+        })
+        .eq("id", trip.id)
+        
+      console.log(`📝 Route saved to database for future consistency`)
+    } catch (routeError) {
+      console.error(`❌ Route calculation failed for ${tripName}:`, routeError)
+      // Emergency fallback
+      routeCoordinates = [
+        { lat: trip.departure.lat, lng: trip.departure.lng },
+        { lat: trip.destination.lat, lng: trip.destination.lng }
+      ]
+      totalDistance = calculateDistance(trip.departure.lat, trip.departure.lng, trip.destination.lat, trip.destination.lng)
     }
   } else {
-    // Fallback: calculate direct distance
-    totalDistance = calculateDistance(
-      trip.departure.lat,
-      trip.departure.lng,
-      trip.destination.lat,
-      trip.destination.lng,
-    )
+    // Ultimate fallback: direct line
+    routeCoordinates = [
+      { lat: trip.departure.lat, lng: trip.departure.lng },
+      { lat: trip.destination.lat, lng: trip.destination.lng }
+    ]
+    totalDistance = calculateDistance(trip.departure.lat, trip.departure.lng, trip.destination.lat, trip.destination.lng)
+    console.log(`🚨 Using emergency fallback route for ${tripName}`)
   }
 
-  // Get realistic speed based on distance
-  const realisticSpeed = getRealisticSpeed(totalDistance)
+  // Get realistic speed based on distance and segments
+  const realisticSpeed = getRealisticSpeed(totalDistance, trip.segments)
   
   // Calculate realistic completion time in minutes
-  const estimatedTripTimeMinutes = (totalDistance / realisticSpeed) * 60
+  const estimatedTripTimeMinutes = estimatedDuration || ((totalDistance / realisticSpeed) * 60)
   
   // Calculate progress per update (every 20 seconds for smooth movement)
   const updateIntervalSeconds = 20
   const totalUpdates = Math.ceil(estimatedTripTimeMinutes * 60 / updateIntervalSeconds)
   const progressPerUpdate = 100 / totalUpdates
 
+  const speedType = trip.segments && trip.segments.some(s => s.type === 'toll_entry') ? 'toll route' : 'regular route'
   console.log(
-    `📊 ${tripName}: Distance: ${totalDistance.toFixed(1)}km, Speed: ${realisticSpeed}km/h, Estimated time: ${estimatedTripTimeMinutes.toFixed(0)} minutes`
+    `📊 ${tripName}: Distance: ${totalDistance.toFixed(1)}km, Speed: ${realisticSpeed}km/h (${speedType}), Estimated time: ${estimatedTripTimeMinutes.toFixed(0)} minutes, Route points: ${routeCoordinates.length} (SYNCHRONIZED)`
   )
 
   const startTime = Date.now()
@@ -147,13 +184,13 @@ const startTripTracking = async (trip) => {
       // Calculate new progress
       const newProgress = Math.min(100, currentTrip.progress + progressPerUpdate)
 
-      // Calculate current position based on route
+      // PERBAIKAN UTAMA: Calculate current position dari SYNCHRONIZED route coordinates
       let currentLat = currentTrip.current_lat
       let currentLng = currentTrip.current_lng
 
-      if (currentTrip.route && Array.isArray(currentTrip.route) && currentTrip.route.length > 0) {
-        const routeIndex = Math.floor((newProgress / 100) * (currentTrip.route.length - 1))
-        const currentPosition = currentTrip.route[routeIndex] || currentTrip.route[0]
+      if (routeCoordinates && Array.isArray(routeCoordinates) && routeCoordinates.length > 0) {
+        const routeIndex = Math.floor((newProgress / 100) * (routeCoordinates.length - 1))
+        const currentPosition = routeCoordinates[routeIndex] || routeCoordinates[0]
         currentLat = currentPosition.lat
         currentLng = currentPosition.lng
       }
@@ -170,7 +207,7 @@ const startTripTracking = async (trip) => {
       if (newProgress >= 100) {
         updates.status = "COMPLETED"
         updates.end_time = new Date().toISOString()
-        console.log(`✅ ${tripName}: Trip completed in ${formatElapsedTime(elapsedTimeMinutes)} - Bus staying at destination`)
+        console.log(`✅ ${tripName}: Trip completed using SYNCHRONIZED route - Bus staying at destination`)
         
         // Set bus as inactive but keep at destination
         await supabase.from("buses").update({ is_active: false }).eq("id", trip.bus_id)
@@ -198,12 +235,12 @@ const startTripTracking = async (trip) => {
 
       // If completed, keep bus at destination (don't remove location)
       if (newProgress >= 100) {
-        console.log(`🏁 ${tripName}: Bus parked at destination - ${trip.destination.name}`)
+        console.log(`🏁 ${tripName}: Bus parked at destination using SYNCHRONIZED route - ${trip.destination.name}`)
         stopTripTracking(trip.id)
       }
 
       console.log(
-        `📊 ${tripName}: ${newProgress.toFixed(1)}% (${formatElapsedTime(elapsedTimeMinutes)}) - ${currentSpeed.toFixed(0)}km/h`
+        `📊 ${tripName}: ${newProgress.toFixed(1)}% (${formatElapsedTime(elapsedTimeMinutes)}) - ${currentSpeed.toFixed(0)}km/h (SYNCHRONIZED route)`
       )
     } catch (error) {
       console.error(`❌ Error tracking ${tripName}:`, error)
@@ -227,7 +264,7 @@ const stopTripTracking = (tripId) => {
 
 // Enhanced initialization with bus positioning
 const initializeTracking = async () => {
-  console.log("🔄 Initializing enhanced backend tracking system...")
+  console.log("🔄 Initializing SYNCHRONIZED backend tracking system...")
 
   try {
     // Test Supabase connection first
@@ -249,7 +286,7 @@ const initializeTracking = async () => {
     }
 
     if (inProgressTrips && inProgressTrips.length > 0) {
-      console.log(`🚀 Found ${inProgressTrips.length} in-progress trips, starting enhanced tracking...`)
+      console.log(`🚀 Found ${inProgressTrips.length} in-progress trips, starting SYNCHRONIZED tracking...`)
 
       for (const trip of inProgressTrips) {
         await startTripTracking(trip)
@@ -285,7 +322,7 @@ const initializeTracking = async () => {
     }
 
   } catch (error) {
-    console.error("❌ Error initializing enhanced tracking:", error)
+    console.error("❌ Error initializing SYNCHRONIZED tracking:", error)
   }
 }
 
@@ -305,7 +342,7 @@ app.get("/api/health", (req, res) => {
     timestamp: new Date().toISOString(),
     supabaseUrl: process.env.NEXT_PUBLIC_SUPABASE_URL ? "✅ Configured" : "❌ Missing",
     supabaseKey: process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ? "✅ Configured" : "❌ Missing",
-    trackingMode: "Enhanced Realistic Speed (25-85 km/h) with Destination Parking",
+    trackingMode: "SYNCHRONIZED Route Preview (25-85 km/h) + Destination Parking",
     updateInterval: "20 seconds",
     trips: activeTripsArray,
   })
@@ -334,13 +371,13 @@ app.post("/api/trips/:tripId/start", async (req, res) => {
     // Update bus status
     await supabase.from("buses").update({ is_active: true }).eq("id", trip.bus_id)
 
-    // Start enhanced realistic tracking
+    // Start SYNCHRONIZED tracking
     await startTripTracking({ ...trip, status: "IN_PROGRESS" })
 
     res.json({ 
       success: true, 
-      message: "Trip started with enhanced realistic speed tracking",
-      trackingMode: "Realistic timing with destination parking enabled"
+      message: "Trip started with SYNCHRONIZED route tracking",
+      trackingMode: "Using exact same route as preview + destination parking enabled"
     })
   } catch (error) {
     console.error("Error starting trip:", error)
@@ -398,9 +435,9 @@ app.get("/api/trips/active", (req, res) => {
 
 // Enhanced real-time subscriptions
 const setupRealtimeSubscriptions = () => {
-  console.log("📡 Setting up enhanced real-time subscriptions...")
+  console.log("📡 Setting up SYNCHRONIZED real-time subscriptions...")
 
-  // Listen for trip changes with bus positioningg
+  // Listen for trip changes with bus positioning
   supabase
     .channel("backend_trips")
     .on("postgres_changes", { event: "*", schema: "public", table: "trips" }, async (payload) => {
@@ -410,7 +447,7 @@ const setupRealtimeSubscriptions = () => {
         const trip = payload.new
 
         if (trip.status === "IN_PROGRESS" && !activeTrips.has(trip.id)) {
-          console.log("🆕 New trip to track:", trip.id.slice(0, 8))
+          console.log("🆕 New trip to track with SYNCHRONIZED route:", trip.id.slice(0, 8))
           await startTripTracking(trip)
         } else if (trip.status !== "IN_PROGRESS" && activeTrips.has(trip.id)) {
           console.log("🛑 Trip no longer in progress:", trip.id.slice(0, 8))
@@ -446,30 +483,31 @@ const setupRealtimeSubscriptions = () => {
 
 // Start server
 app.listen(PORT, async () => {
-  console.log(`🚀 Enhanced Bus Tracking Backend Server running on port ${PORT}`)
+  console.log(`🚀 SYNCHRONIZED Bus Tracking Backend Server running on port ${PORT}`)
   console.log(`📊 Health check: http://localhost:${PORT}/api/health`)
   console.log(`🔧 Environment:`)
   console.log(`   - Supabase URL: ${process.env.NEXT_PUBLIC_SUPABASE_URL ? "✅ Configured" : "❌ Missing"}`)
   console.log(`   - Supabase Key: ${process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ? "✅ Configured" : "❌ Missing"}`)
-  console.log(`🚌 Tracking Mode: Enhanced Realistic Speed (25-85 km/h) with Destination Parking`)
+  console.log(`🚌 Tracking Mode: SYNCHRONIZED Route Preview (25-85 km/h) + Destination Parking`)
   console.log(`⏱️ Update Interval: 20 seconds for optimal real-time experience`)
+  console.log(`🛣️ Routing: Uses EXACT same route coordinates as preview (no recalculation)`)
 
-  // Initialize enhanced tracking and subscriptions
+  // Initialize SYNCHRONIZED tracking and subscriptions
   await initializeTracking()
   setupRealtimeSubscriptions()
 
-  console.log("✅ Enhanced backend tracking system ready with destination parking!")
+  console.log("✅ SYNCHRONIZED backend tracking system ready!")
 })
 
 // Graceful shutdown
 process.on("SIGINT", () => {
-  console.log("🛑 Shutting down enhanced backend server...")
+  console.log("🛑 Shutting down SYNCHRONIZED backend server...")
 
   // Clear all intervals
   trackingIntervals.forEach((interval) => clearInterval(interval))
   trackingIntervals.clear()
   activeTrips.clear()
 
-  console.log("✅ Enhanced backend server stopped")
+  console.log("✅ SYNCHRONIZED backend server stopped")
   process.exit(0)
 })
