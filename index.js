@@ -29,6 +29,9 @@ const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL, process.env.
 const activeTrips = new Map()
 const trackingIntervals = new Map()
 
+// BARU: Stop tracking state untuk mengatur durasi berhenti
+const stopStates = new Map() // { tripId: { currentStopIndex: number, stopStartTime: number, isAtStop: boolean } }
+
 // Utility functions
 const calculateDistance = (lat1, lng1, lat2, lng2) => {
   const R = 6371 // Earth's radius in kilometers
@@ -81,31 +84,43 @@ const formatElapsedTime = (minutes) => {
   return `${mins}m`
 }
 
-// PERBAIKAN UTAMA: Enhanced tracking yang menggunakan route coordinates yang sudah ada
+// PERBAIKAN UTAMA: Enhanced tracking dengan REAL stop duration support
 const startTripTracking = async (trip) => {
-  console.log(`🚀 Starting SYNCHRONIZED backend tracking for trip: ${trip.id}`)
+  console.log(`🚀 Starting ENHANCED backend tracking for trip: ${trip.id}`)
 
   // Stop existing tracking if any
   if (trackingIntervals.has(trip.id)) {
     clearInterval(trackingIntervals.get(trip.id))
   }
 
+  // Initialize stop state
+  const stopSegments = trip.segments ? trip.segments.filter(s => s.type === 'stop').sort((a, b) => a.order - b.order) : []
+  stopStates.set(trip.id, {
+    currentStopIndex: -1, // -1 means not at any stop yet
+    stopStartTime: null,
+    isAtStop: false,
+    stopSegments: stopSegments,
+    totalStopDuration: stopSegments.reduce((total, segment) => total + (segment.stop_duration || 0), 0)
+  })
+
+  console.log(`🛑 Trip ${trip.id.slice(0, 8)} has ${stopSegments.length} stops with total duration: ${stopStates.get(trip.id).totalStopDuration} minutes`)
+
   // Get bus info
   const { data: bus } = await supabase.from("buses").select("*").eq("id", trip.bus_id).single()
   const tripName = bus?.nickname || trip.id.slice(0, 8)
 
-  // PERBAIKAN UTAMA: Gunakan route coordinates yang sudah ada di trip, jangan hitung ulang
+  // Use route coordinates that exist in trip
   let routeCoordinates = []
   let totalDistance = 0
   let estimatedDuration = trip.estimated_duration || 0
 
   if (trip.route && trip.route.length > 0) {
-    // BAGUS: Gunakan route coordinates yang sudah tersimpan (sinkron dengan preview)
+    // Use synchronized route with existing coordinates
     routeCoordinates = trip.route
     totalDistance = trip.distance || 0
     console.log(`✅ Using SYNCHRONIZED route with ${routeCoordinates.length} points from trip database`)
   } else if (trip.segments && trip.segments.length > 0) {
-    // Fallback: hitung route dari segments (hanya jika tidak ada route tersimpan)
+    // Fallback: calculate route from segments
     console.log(`⚠️ No route found in trip, calculating from segments...`)
     try {
       const routeData = await calculateRouteFromSegments(trip.segments)
@@ -113,7 +128,7 @@ const startTripTracking = async (trip) => {
       totalDistance = routeData.distance
       estimatedDuration = routeData.duration
       
-      // Simpan route hasil perhitungan ke database untuk konsistensi
+      // Save route to database for consistency
       await supabase
         .from("trips")
         .update({
@@ -146,17 +161,22 @@ const startTripTracking = async (trip) => {
   // Get realistic speed based on distance and segments
   const realisticSpeed = getRealisticSpeed(totalDistance, trip.segments)
   
-  // Calculate realistic completion time in minutes
-  const estimatedTripTimeMinutes = estimatedDuration || ((totalDistance / realisticSpeed) * 60)
+  // PERBAIKAN: Calculate completion time WITHOUT stop durations first (pure travel time)
+  const pureTravelTimeMinutes = estimatedDuration || ((totalDistance / realisticSpeed) * 60)
   
-  // Calculate progress per update (every 20 seconds for smooth movement)
+  // Add total stop duration to get actual trip time
+  const stopState = stopStates.get(trip.id)
+  const totalStopDurationMinutes = stopState ? stopState.totalStopDuration : 0
+  const totalTripTimeMinutes = pureTravelTimeMinutes + totalStopDurationMinutes
+  
+  // Calculate progress per update for TRAVEL TIME only (stops are handled separately)
   const updateIntervalSeconds = 20
-  const totalUpdates = Math.ceil(estimatedTripTimeMinutes * 60 / updateIntervalSeconds)
-  const progressPerUpdate = 100 / totalUpdates
+  const totalTravelUpdates = Math.ceil(pureTravelTimeMinutes * 60 / updateIntervalSeconds)
+  const progressPerUpdate = 100 / totalTravelUpdates
 
   const speedType = trip.segments && trip.segments.some(s => s.type === 'toll_entry') ? 'toll route' : 'regular route'
   console.log(
-    `📊 ${tripName}: Distance: ${totalDistance.toFixed(1)}km, Speed: ${realisticSpeed}km/h (${speedType}), Estimated time: ${estimatedTripTimeMinutes.toFixed(0)} minutes, Route points: ${routeCoordinates.length} (SYNCHRONIZED)`
+    `📊 ${tripName}: Distance: ${totalDistance.toFixed(1)}km, Speed: ${realisticSpeed}km/h (${speedType}), Pure travel: ${pureTravelTimeMinutes.toFixed(0)}min, Stop duration: ${totalStopDurationMinutes}min, Total time: ${totalTripTimeMinutes.toFixed(0)}min, Route points: ${routeCoordinates.length} (ENHANCED WITH REAL STOPS)`
   )
 
   const startTime = Date.now()
@@ -177,14 +197,79 @@ const startTripTracking = async (trip) => {
       const elapsedTimeMs = Date.now() - startTime
       const elapsedTimeMinutes = elapsedTimeMs / (1000 * 60)
 
-      // Vary speed slightly for realism (+/- 5 km/h)
-      const speedVariation = (Math.random() - 0.5) * 10
-      currentSpeed = Math.max(15, Math.min(90, realisticSpeed + speedVariation))
+      const stopState = stopStates.get(trip.id)
+      if (!stopState) {
+        console.error(`❌ ${tripName}: Stop state not found`)
+        return
+      }
 
-      // Calculate new progress
-      const newProgress = Math.min(100, currentTrip.progress + progressPerUpdate)
+      let newProgress = currentTrip.progress
+      let isMoving = true
+      let statusMessage = "Moving"
 
-      // PERBAIKAN UTAMA: Calculate current position dari SYNCHRONIZED route coordinates
+      // PERBAIKAN UTAMA: Enhanced stop logic
+      if (stopState.stopSegments && stopState.stopSegments.length > 0) {
+        // Check if we should be at a stop based on current progress
+        const currentProgressInRoute = (newProgress / 100) * (routeCoordinates.length - 1)
+        
+        // Find which stop segment we should be at based on route progress
+        for (let i = 0; i < stopState.stopSegments.length; i++) {
+          const stopSegment = stopState.stopSegments[i]
+          const stopRouteIndex = findStopPositionInRoute(stopSegment, routeCoordinates, trip.segments)
+          
+          // Calculate progress percentage for this stop
+          const stopProgressPercent = (stopRouteIndex / (routeCoordinates.length - 1)) * 100
+          
+          // Check if we've reached this stop
+          if (newProgress >= stopProgressPercent - 2 && newProgress <= stopProgressPercent + 2) {
+            // We're at this stop
+            if (!stopState.isAtStop || stopState.currentStopIndex !== i) {
+              // Just arrived at stop
+              console.log(`🛑 ${tripName}: ARRIVED AT STOP ${i + 1}: ${stopSegment.location.name} (Duration: ${stopSegment.stop_duration}min)`)
+              stopState.isAtStop = true
+              stopState.currentStopIndex = i
+              stopState.stopStartTime = Date.now()
+            }
+            
+            // Check if we've been at stop long enough
+            const stopElapsedMinutes = stopState.stopStartTime ? (Date.now() - stopState.stopStartTime) / (1000 * 60) : 0
+            const requiredStopDuration = stopSegment.stop_duration || 30
+            
+            if (stopElapsedMinutes < requiredStopDuration) {
+              // Still need to wait at stop
+              isMoving = false
+              statusMessage = `Stopped at ${stopSegment.location.name} (${Math.ceil(requiredStopDuration - stopElapsedMinutes)}min remaining)`
+              console.log(`⏱️ ${tripName}: WAITING AT STOP ${i + 1}: ${stopElapsedMinutes.toFixed(1)}/${requiredStopDuration}min`)
+              
+              // Don't update progress while at stop
+              break
+            } else {
+              // Stop duration completed, can continue
+              if (stopState.isAtStop) {
+                console.log(`✅ ${tripName}: STOP ${i + 1} COMPLETED: ${stopSegment.location.name} after ${stopElapsedMinutes.toFixed(1)}min`)
+                stopState.isAtStop = false
+                stopState.currentStopIndex = -1
+                stopState.stopStartTime = null
+                isMoving = true
+                statusMessage = "Continuing journey"
+              }
+            }
+            break
+          }
+        }
+      }
+
+      // Only update progress if bus is moving
+      if (isMoving) {
+        // Vary speed slightly for realism (+/- 5 km/h)
+        const speedVariation = (Math.random() - 0.5) * 10
+        currentSpeed = Math.max(15, Math.min(90, realisticSpeed + speedVariation))
+
+        // Calculate new progress
+        newProgress = Math.min(100, currentTrip.progress + progressPerUpdate)
+      }
+
+      // Calculate current position from SYNCHRONIZED route coordinates
       let currentLat = currentTrip.current_lat
       let currentLng = currentTrip.current_lng
 
@@ -200,14 +285,14 @@ const startTripTracking = async (trip) => {
         progress: newProgress,
         current_lat: currentLat,
         current_lng: currentLng,
-        speed: Math.round(currentSpeed),
+        speed: isMoving ? Math.round(currentSpeed) : 0, // Speed 0 when stopped
       }
 
       // If completed, mark as completed but keep bus at destination
       if (newProgress >= 100) {
         updates.status = "COMPLETED"
         updates.end_time = new Date().toISOString()
-        console.log(`✅ ${tripName}: Trip completed using SYNCHRONIZED route - Bus staying at destination`)
+        console.log(`✅ ${tripName}: Trip completed using SYNCHRONIZED route with REAL stops - Bus staying at destination`)
         
         // Set bus as inactive but keep at destination
         await supabase.from("buses").update({ is_active: false }).eq("id", trip.bus_id)
@@ -233,14 +318,15 @@ const startTripTracking = async (trip) => {
         })
       }
 
-      // If completed, keep bus at destination (don't remove location)
+      // If completed, keep bus at destination and clean up stop state
       if (newProgress >= 100) {
-        console.log(`🏁 ${tripName}: Bus parked at destination using SYNCHRONIZED route - ${trip.destination.name}`)
+        console.log(`🏁 ${tripName}: Bus parked at destination using SYNCHRONIZED route with REAL stops - ${trip.destination.name}`)
+        stopStates.delete(trip.id) // Clean up stop state
         stopTripTracking(trip.id)
       }
 
       console.log(
-        `📊 ${tripName}: ${newProgress.toFixed(1)}% (${formatElapsedTime(elapsedTimeMinutes)}) - ${currentSpeed.toFixed(0)}km/h (SYNCHRONIZED route)`
+        `📊 ${tripName}: ${newProgress.toFixed(1)}% (${formatElapsedTime(elapsedTimeMinutes)}) - ${statusMessage} - ${updates.speed}km/h`
       )
     } catch (error) {
       console.error(`❌ Error tracking ${tripName}:`, error)
@@ -248,7 +334,24 @@ const startTripTracking = async (trip) => {
   }, updateIntervalSeconds * 1000) // Update every 20 seconds
 
   trackingIntervals.set(trip.id, interval)
-  activeTrips.set(trip.id, { ...trip, speed: realisticSpeed, startTime, totalDistance, estimatedTime: estimatedTripTimeMinutes })
+  activeTrips.set(trip.id, { ...trip, speed: realisticSpeed, startTime, totalDistance, estimatedTime: totalTripTimeMinutes })
+}
+
+// Helper function to find stop position in route coordinates
+const findStopPositionInRoute = (stopSegment, routeCoordinates, allSegments) => {
+  if (!stopSegment || !routeCoordinates || !allSegments) return 0
+  
+  // Find the stop segment in the ordered segments list
+  const orderedSegments = allSegments.sort((a, b) => a.order - b.order)
+  const stopIndex = orderedSegments.findIndex(s => s.id === stopSegment.id)
+  
+  if (stopIndex === -1) return 0
+  
+  // Calculate approximate position in route based on segment order
+  const segmentRatio = stopIndex / (orderedSegments.length - 1)
+  const approximateIndex = Math.floor(segmentRatio * (routeCoordinates.length - 1))
+  
+  return Math.min(approximateIndex, routeCoordinates.length - 1)
 }
 
 // Stop tracking a trip
@@ -258,13 +361,14 @@ const stopTripTracking = (tripId) => {
     clearInterval(interval)
     trackingIntervals.delete(tripId)
     activeTrips.delete(tripId)
+    stopStates.delete(tripId) // Clean up stop state
     console.log(`🛑 Stopped tracking trip: ${tripId.slice(0, 8)}`)
   }
 }
 
 // Enhanced initialization with bus positioning
 const initializeTracking = async () => {
-  console.log("🔄 Initializing SYNCHRONIZED backend tracking system...")
+  console.log("🔄 Initializing ENHANCED backend tracking system with REAL stop durations...")
 
   try {
     // Test Supabase connection first
@@ -286,7 +390,7 @@ const initializeTracking = async () => {
     }
 
     if (inProgressTrips && inProgressTrips.length > 0) {
-      console.log(`🚀 Found ${inProgressTrips.length} in-progress trips, starting SYNCHRONIZED tracking...`)
+      console.log(`🚀 Found ${inProgressTrips.length} in-progress trips, starting ENHANCED tracking with REAL stops...`)
 
       for (const trip of inProgressTrips) {
         await startTripTracking(trip)
@@ -322,7 +426,7 @@ const initializeTracking = async () => {
     }
 
   } catch (error) {
-    console.error("❌ Error initializing SYNCHRONIZED tracking:", error)
+    console.error("❌ Error initializing ENHANCED tracking with REAL stops:", error)
   }
 }
 
@@ -334,16 +438,23 @@ app.get("/api/health", (req, res) => {
     distance: trip.totalDistance,
     estimatedTime: trip.estimatedTime,
     elapsedMinutes: (Date.now() - trip.startTime) / (1000 * 60),
+    hasStops: trip.segments ? trip.segments.filter(s => s.type === 'stop').length : 0
   }))
+
+  const totalActiveStops = Array.from(stopStates.values()).reduce((total, state) => {
+    return total + (state.stopSegments ? state.stopSegments.length : 0)
+  }, 0)
 
   res.json({
     status: "OK",
     activeTrips: activeTrips.size,
+    activeStops: totalActiveStops,
     timestamp: new Date().toISOString(),
     supabaseUrl: process.env.NEXT_PUBLIC_SUPABASE_URL ? "✅ Configured" : "❌ Missing",
     supabaseKey: process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ? "✅ Configured" : "❌ Missing",
-    trackingMode: "SYNCHRONIZED Route Preview (25-85 km/h) + Destination Parking",
+    trackingMode: "ENHANCED Route Preview (25-85 km/h) + REAL Stop Durations + Destination Parking",
     updateInterval: "20 seconds",
+    stopDurationSupport: "1 minute - unlimited hours",
     trips: activeTripsArray,
   })
 })
@@ -371,13 +482,22 @@ app.post("/api/trips/:tripId/start", async (req, res) => {
     // Update bus status
     await supabase.from("buses").update({ is_active: true }).eq("id", trip.bus_id)
 
-    // Start SYNCHRONIZED tracking
+    // Start ENHANCED tracking with REAL stops
     await startTripTracking({ ...trip, status: "IN_PROGRESS" })
+
+    const stopCount = trip.segments ? trip.segments.filter(s => s.type === 'stop').length : 0
+    const totalStopDuration = trip.segments ? 
+      trip.segments.filter(s => s.type === 'stop').reduce((total, s) => total + (s.stop_duration || 0), 0) : 0
 
     res.json({ 
       success: true, 
-      message: "Trip started with SYNCHRONIZED route tracking",
-      trackingMode: "Using exact same route as preview + destination parking enabled"
+      message: "Trip started with ENHANCED route tracking and REAL stop durations",
+      trackingMode: "Using exact same route as preview + real stop durations + destination parking enabled",
+      stopInfo: {
+        totalStops: stopCount,
+        totalStopDuration: `${totalStopDuration} minutes`,
+        features: "Bus will actually stop at each location for the specified duration"
+      }
     })
   } catch (error) {
     console.error("Error starting trip:", error)
@@ -420,22 +540,31 @@ app.post("/api/trips/:tripId/cancel", async (req, res) => {
 })
 
 app.get("/api/trips/active", (req, res) => {
-  const activeTripsArray = Array.from(activeTrips.values()).map((trip) => ({
-    id: trip.id,
-    bus_id: trip.bus_id,
-    speed: trip.speed,
-    totalDistance: trip.totalDistance,
-    estimatedTime: trip.estimatedTime,
-    startTime: trip.startTime,
-    elapsedMinutes: (Date.now() - trip.startTime) / (1000 * 60),
-  }))
+  const activeTripsArray = Array.from(activeTrips.values()).map((trip) => {
+    const stopState = stopStates.get(trip.id)
+    return {
+      id: trip.id,
+      bus_id: trip.bus_id,
+      speed: trip.speed,
+      totalDistance: trip.totalDistance,
+      estimatedTime: trip.estimatedTime,
+      startTime: trip.startTime,
+      elapsedMinutes: (Date.now() - trip.startTime) / (1000 * 60),
+      stopInfo: stopState ? {
+        totalStops: stopState.stopSegments.length,
+        currentStopIndex: stopState.currentStopIndex,
+        isAtStop: stopState.isAtStop,
+        totalStopDuration: stopState.totalStopDuration
+      } : null
+    }
+  })
 
   res.json(activeTripsArray)
 })
 
 // Enhanced real-time subscriptions
 const setupRealtimeSubscriptions = () => {
-  console.log("📡 Setting up SYNCHRONIZED real-time subscriptions...")
+  console.log("📡 Setting up ENHANCED real-time subscriptions with REAL stop support...")
 
   // Listen for trip changes with bus positioning
   supabase
@@ -447,7 +576,7 @@ const setupRealtimeSubscriptions = () => {
         const trip = payload.new
 
         if (trip.status === "IN_PROGRESS" && !activeTrips.has(trip.id)) {
-          console.log("🆕 New trip to track with SYNCHRONIZED route:", trip.id.slice(0, 8))
+          console.log("🆕 New trip to track with ENHANCED REAL stops:", trip.id.slice(0, 8))
           await startTripTracking(trip)
         } else if (trip.status !== "IN_PROGRESS" && activeTrips.has(trip.id)) {
           console.log("🛑 Trip no longer in progress:", trip.id.slice(0, 8))
@@ -483,31 +612,34 @@ const setupRealtimeSubscriptions = () => {
 
 // Start server
 app.listen(PORT, async () => {
-  console.log(`🚀 SYNCHRONIZED Bus Tracking Backend Server running on port ${PORT}`)
+  console.log(`🚀 ENHANCED Bus Tracking Backend Server running on port ${PORT}`)
   console.log(`📊 Health check: http://localhost:${PORT}/api/health`)
   console.log(`🔧 Environment:`)
   console.log(`   - Supabase URL: ${process.env.NEXT_PUBLIC_SUPABASE_URL ? "✅ Configured" : "❌ Missing"}`)
   console.log(`   - Supabase Key: ${process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ? "✅ Configured" : "❌ Missing"}`)
-  console.log(`🚌 Tracking Mode: SYNCHRONIZED Route Preview (25-85 km/h) + Destination Parking`)
+  console.log(`🚌 Tracking Mode: ENHANCED Route Preview (25-85 km/h) + REAL Stop Durations (1min-unlimited) + Destination Parking`)
   console.log(`⏱️ Update Interval: 20 seconds for optimal real-time experience`)
   console.log(`🛣️ Routing: Uses EXACT same route coordinates as preview (no recalculation)`)
+  console.log(`🛑 Stop Duration: REAL implementation - bus actually stops for specified time`)
+  console.log(`📍 Stop Support: Flexible duration from 1 minute to several hours`)
 
-  // Initialize SYNCHRONIZED tracking and subscriptions
+  // Initialize ENHANCED tracking and subscriptions
   await initializeTracking()
   setupRealtimeSubscriptions()
 
-  console.log("✅ SYNCHRONIZED backend tracking system ready!")
+  console.log("✅ ENHANCED backend tracking system with REAL stop durations ready!")
 })
 
 // Graceful shutdown
 process.on("SIGINT", () => {
-  console.log("🛑 Shutting down SYNCHRONIZED backend server...")
+  console.log("🛑 Shutting down ENHANCED backend server...")
 
-  // Clear all intervals
+  // Clear all intervals and stop states
   trackingIntervals.forEach((interval) => clearInterval(interval))
   trackingIntervals.clear()
   activeTrips.clear()
+  stopStates.clear()
 
-  console.log("✅ SYNCHRONIZED backend server stopped")
+  console.log("✅ ENHANCED backend server stopped")
   process.exit(0)
 })
